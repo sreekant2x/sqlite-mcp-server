@@ -23,6 +23,54 @@ tools and resources and on running the model's SQL safely.
       bookstore.db
 ```
 
+## About this project
+
+I built this to learn how an AI tool connects to real data. Model Context Protocol is the
+standard that lets an AI model talk to outside tools and data: a server exposes
+capabilities, and any MCP client can use them. This version is built on the official MCP
+Python SDK, so the SDK handles the protocol plumbing and I focus on exposing a SQLite
+database and running the model's SQL safely. (I also wrote a from-scratch version of the
+same server, without the SDK, to understand every layer underneath it.)
+
+**What it is.** A server that gives an AI agent read-only access to a local SQLite
+database. The agent asks a question in plain language; it reads the database's structure,
+writes the SQL itself, and my server runs that SQL safely and returns the rows. One thing I
+want to be clear about: the server does not do the natural-language part. The model writes
+the SQL. My job was to expose the database well and to make running untrusted SQL safe.
+
+**The pathway — how a request flows through it.** An MCP client (a desktop AI app, an IDE,
+or the MCP Inspector) launches my server as a child process and talks to it over stdin and
+stdout. A request flows like this:
+
+1. The SDK (`FastMCP`) receives the message, handles the JSON-RPC framing and the stdio
+   transport, runs the `initialize` handshake where the client and server agree on a
+   protocol version and exchange capabilities, and dispatches to the right handler.
+2. `server.py` — my handlers: the three tools (`list_tables`, `describe_table`,
+   `run_query`), the schema resource and per-table template, and one prompt. The SDK also
+   generates each tool's argument schema from my Python type hints.
+3. `database.py` — the read-only query engine that actually runs the SQL.
+
+**How it works, step by step.** The client sends `initialize`; the SDK answers with the
+protocol version and capabilities. The model then calls `list_tables`, calls
+`describe_table` on the tables it cares about, writes a `SELECT`, and calls `run_query`. I
+run that query in a sandbox, cap the number of rows, and send them back. If the SQL is
+invalid or tries to write, I raise an error, which the SDK returns to the model as a result
+it can read and retry on.
+
+**Two design choices I'd call out.** First, the read-only guarantee isn't a check that the
+query "starts with SELECT" — a string check can't see what a statement really does. It uses
+SQLite's authorizer, which inspects the parsed statement and blocks anything that isn't a
+read before it runs, so `DROP`, `ATTACH`, `PRAGMA`, and even a `DELETE` hidden inside a
+`WITH` are all refused. The SDK does not do this; it's mine, in `database.py`. Second, bad
+SQL comes back to the model as a tool result marked `isError: true`, not as a protocol-level
+error — so the model, which is the thing that can fix the query, sees the failure and tries
+again instead of the client swallowing it.
+
+**How someone uses it.** Point it at any SQLite file and connect it to an MCP client (see
+Quick start below), or run `scripts/raw_client.py` to watch a whole session on the wire
+without any client at all. There's a sample bookstore database included so it works out of
+the box.
+
 ## Where the "natural language" actually happens
 
 Not here. The server never sees an English question it has to interpret. The client's
