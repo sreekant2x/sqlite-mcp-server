@@ -5,19 +5,17 @@ build-backend = "hatchling.build"
 [project]
 name = "sqlite-mcp-server"
 version = "0.1.0"
-description = "A read-only SQLite MCP server with JSON-RPC, stdio and MCP written from scratch."
+description = "A read-only SQLite MCP server built on the official MCP Python SDK."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["mcp>=1.10,<2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
-# Only used by tests/test_sdk_interop.py, to check an independent client accepts this server.
-interop = ["mcp>=1.10"]
 
 [project.scripts]
-sqlite-mcp-server = "sqlite_mcp.app:main"
+sqlite-mcp-server = "sqlite_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sqlite_mcp"]

@@ -23,7 +23,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .protocol import ToolError
+
+class ToolError(Exception):
+    """A failure the model should see and can recover from, such as bad SQL.
+
+    The SDK turns an exception raised inside a tool into a tool result with
+    ``isError: true``, so the model reads the message and can fix its query, rather
+    than a protocol-level error the client would swallow.
+    """
+
 
 DEFAULT_ROW_LIMIT = 100
 MAX_ROW_LIMIT = 1000
