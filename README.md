@@ -1,21 +1,23 @@
 # sqlite-mcp-server
 
 A [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI agent
-read-only access to a local SQLite database. Ask a connected agent "which city spends the most on
-books?" and it explores the schema, writes the SQL, runs it here and answers.
+read-only access to a local SQLite database. Ask a connected agent "which city spends the
+most on books?" and it explores the schema, writes the SQL, runs it here and answers.
 
-The protocol is written by hand in plain Python, with no MCP SDK and no third-party
-dependencies, so every layer between the model and the database is visible and tested.
+It's built on the **official MCP Python SDK** (`mcp`, the `FastMCP` high-level API). The
+SDK handles the protocol plumbing; this project focuses on exposing a SQLite database as
+tools and resources and on running the model's SQL safely.
 
 ```
- Agent host / IDE / Inspector  (the MCP client, which owns the LLM)
+ Agent host / IDE / Inspector   (the MCP client, which owns the LLM)
           |  stdin/stdout pipes
           v
- transport.py   Layer 2  newline-delimited messages over stdio
- jsonrpc.py     Layer 1  JSON-RPC 2.0 parsing, ids, error codes
- protocol.py    Layer 3  MCP lifecycle, capabilities, tools/resources/prompts
- app.py         Layer 4  the SQLite tools, resource and prompt
- database.py             read-only, sandboxed query execution
+ the MCP SDK (FastMCP)   JSON-RPC 2.0, stdio, the initialize handshake,
+                         capabilities, tools/resources/prompts dispatch
+          |
+          v
+ server.py      our tools, resource template and prompt
+ database.py    read-only, sandboxed query execution
           |
           v
       bookstore.db
@@ -23,11 +25,12 @@ dependencies, so every layer between the model and the database is visible and t
 
 ## About this project
 
-I built this to understand what actually happens underneath an AI tool, instead of
-treating the protocol as a black box. Model Context Protocol is the standard that lets an
-AI model talk to outside tools and data: a server exposes capabilities, and any MCP client
-can use them. There's an official SDK that hides the protocol, but I wanted to see every
-layer, so I wrote the whole stack by hand in plain Python with no dependencies.
+I built this to learn how an AI tool connects to real data. Model Context Protocol is the
+standard that lets an AI model talk to outside tools and data: a server exposes
+capabilities, and any MCP client can use them. This version is built on the official MCP
+Python SDK, so the SDK handles the protocol plumbing and I focus on exposing a SQLite
+database and running the model's SQL safely. (I also wrote a from-scratch version of the
+same server, without the SDK, to understand every layer underneath it.)
 
 **What it is.** A server that gives an AI agent read-only access to a local SQLite
 database. The agent asks a question in plain language; it reads the database's structure,
@@ -37,32 +40,31 @@ the SQL. My job was to expose the database well and to make running untrusted SQ
 
 **The pathway — how a request flows through it.** An MCP client (a desktop AI app, an IDE,
 or the MCP Inspector) launches my server as a child process and talks to it over stdin and
-stdout. A request travels down four layers, each one only knowing about the one below it:
+stdout. A request flows like this:
 
-1. `jsonrpc.py` — every message is a JSON-RPC 2.0 object (a request, a notification, or a
-   response). This layer just parses the text and builds replies.
-2. `transport.py` — moves one JSON message per line over the pipes. Its one hard rule is
-   that stdout is only for protocol messages; all logging goes to stderr, or the stream gets
-   corrupted and the client disconnects.
-3. `protocol.py` — the MCP lifecycle: the `initialize` handshake where the client and
-   server agree on a protocol version and exchange capabilities, then the three things a
-   server can expose — tools, resources, and prompts.
-4. `app.py` + `database.py` — the actual SQLite tools, and the read-only query engine.
+1. The SDK (`FastMCP`) receives the message, handles the JSON-RPC framing and the stdio
+   transport, runs the `initialize` handshake where the client and server agree on a
+   protocol version and exchange capabilities, and dispatches to the right handler.
+2. `server.py` — my handlers: the three tools (`list_tables`, `describe_table`,
+   `run_query`), the schema resource and per-table template, and one prompt. The SDK also
+   generates each tool's argument schema from my Python type hints.
+3. `database.py` — the read-only query engine that actually runs the SQL.
 
-**How it works, step by step.** The client sends `initialize`; I answer with the protocol
-version I support and my capabilities. The model then calls `list_tables`, calls
+**How it works, step by step.** The client sends `initialize`; the SDK answers with the
+protocol version and capabilities. The model then calls `list_tables`, calls
 `describe_table` on the tables it cares about, writes a `SELECT`, and calls `run_query`. I
 run that query in a sandbox, cap the number of rows, and send them back. If the SQL is
-invalid or tries to write, I return an error the model can read and retry on.
+invalid or tries to write, I raise an error, which the SDK returns to the model as a result
+it can read and retry on.
 
 **Two design choices I'd call out.** First, the read-only guarantee isn't a check that the
 query "starts with SELECT" — a string check can't see what a statement really does. It uses
 SQLite's authorizer, which inspects the parsed statement and blocks anything that isn't a
 read before it runs, so `DROP`, `ATTACH`, `PRAGMA`, and even a `DELETE` hidden inside a
-`WITH` are all refused. Second, bad SQL comes back as a normal tool result marked
-`isError: true`, not as a JSON-RPC protocol error. That's deliberate: the model is the one
-that can fix the query, so it needs to see the failure and try again, rather than have the
-client swallow it.
+`WITH` are all refused. The SDK does not do this; it's mine, in `database.py`. Second, bad
+SQL comes back to the model as a tool result marked `isError: true`, not as a protocol-level
+error — so the model, which is the thing that can fix the query, sees the failure and tries
+again instead of the client swallowing it.
 
 **How someone uses it.** Point it at any SQLite file and connect it to an MCP client (see
 Quick start below), or run `scripts/raw_client.py` to watch a whole session on the wire
@@ -72,11 +74,24 @@ the box.
 ## Where the "natural language" actually happens
 
 Not here. The server never sees an English question it has to interpret. The client's
-model reads the tool descriptions, calls `list_tables` and `describe_table`, writes SQL
-itself and sends it to `run_query`. The server's two jobs are to make that easy (clear
-descriptions, schema on demand, errors the model can learn from) and to make it safe
-(the model's SQL is untrusted input). That split is the whole point of MCP: the server
-exposes capabilities, the model decides how to use them.
+model reads the tool descriptions and schema, calls `list_tables` and `describe_table`,
+writes SQL itself and sends it to `run_query`. The server's two jobs are to make that easy
+(clear descriptions, schema on demand, errors the model can learn from) and to make it safe
+(the model's SQL is untrusted input).
+
+## What the SDK does, and what this project does
+
+| The SDK (`FastMCP`) handles | This project owns |
+| --- | --- |
+| JSON-RPC 2.0 framing and error codes | the three SQLite tools |
+| the stdio transport | the schema resource + per-table template |
+| the `initialize` handshake and capability negotiation | the `ask_database` prompt |
+| `tools/list`, `tools/call`, resources, prompts dispatch | **the read-only safety model** (`database.py`) |
+| generating each tool's JSON Schema from type hints | the sample database |
+| turning an exception in a tool into `isError: true` | |
+
+The one thing the SDK does **not** do is keep the model's SQL safe — that's the interesting
+part and it's all in `database.py`.
 
 ## Quick start
 
@@ -95,7 +110,8 @@ pytest                                          # run the tests
 
 ### Use it from a desktop MCP client
 
-Add this to your client's MCP config file (for example `claude_desktop_config.json`), with absolute paths:
+Add this to your client's MCP config file (for example `claude_desktop_config.json`), with
+absolute paths:
 
 ```json
 {
@@ -116,140 +132,71 @@ Restart the client and ask "Which author has earned the most revenue, and from w
 npx @modelcontextprotocol/inspector .venv/bin/python -m sqlite_mcp bookstore.db
 ```
 
-## The layers, one by one
+## What the server exposes (`server.py`)
 
-### Layer 1: JSON-RPC 2.0 ([`jsonrpc.py`](src/sqlite_mcp/jsonrpc.py))
+Three primitives, split by who decides to use them:
 
-MCP does not invent a wire format. Every message is a JSON-RPC 2.0 object, one of three kinds:
-
-| Kind | Shape | Gets a reply? |
+| Primitive | Controlled by | Here |
 | --- | --- | --- |
-| Request | `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}` | Yes, with the same `id` |
-| Notification | `{"jsonrpc":"2.0","method":"notifications/initialized"}` | Never, not even an error |
-| Response | `{"jsonrpc":"2.0","id":1,"result":{...}}` or `"error":{...}` | No |
+| Tools | the model | `list_tables`, `describe_table`, `run_query` |
+| Resources | the application | `sqlite://schema`, `sqlite://table/{table}` |
+| Prompts | the user | `ask_database` |
 
-The `id` is how replies are matched to requests, which is what lets a client have several
-requests in flight. Errors use standard codes: `-32700` parse error, `-32600` invalid
-request, `-32601` method not found, `-32602` invalid params, `-32603` internal error. When
-a message is so broken the `id` can't be read, the error goes back with `"id": null`.
+Each tool's argument schema is generated by the SDK from the function's type hints and
+`pydantic.Field` annotations — for example `run_query`'s `limit` is advertised as an integer
+between 1 and 1000.
 
-MCP narrows JSON-RPC in a few places, and this server enforces them: ids must be strings
-or integers (never `null`), `params` must be an object, and batches (JSON arrays of
-messages) were removed from MCP in protocol version 2025-06-18.
-
-### Layer 2: the stdio transport ([`transport.py`](src/sqlite_mcp/transport.py))
-
-The client starts the server as a child process. The client writes requests to the
-server's stdin, one JSON message per line; the server writes replies to stdout, one per
-line; the session ends when the client closes stdin.
-
-Two mistakes kill stdio servers, and both are handled here:
-
-- **Writing anything else to stdout.** A single debug `print()` corrupts the stream. All
-  logging goes to stderr (`app.py` configures this), and `tests/test_stdio.py` asserts that
-  every stdout line parses as JSON-RPC.
-- **Not flushing.** stdout to a pipe is block-buffered, so an unflushed reply sits in a
-  buffer and the client thinks the server hung. Every reply is flushed.
-
-The transport knows nothing about MCP: it moves lines and calls a callback. MCP's other
-transport, Streamable HTTP, would replace only this file.
-
-### Layer 3: the MCP protocol ([`protocol.py`](src/sqlite_mcp/protocol.py))
-
-**Lifecycle.** A session starts with a handshake:
-
-```
---> initialize {protocolVersion: "2025-06-18", capabilities: {...}, clientInfo: {...}}
-<-- {protocolVersion: "2025-06-18", capabilities: {tools, resources, prompts}, serverInfo, instructions}
---> notifications/initialized
-```
-
-*Version negotiation:* if the server supports the client's version it echoes it,
-otherwise it answers with its own latest and the client decides whether to continue.
-*Capability negotiation:* the server lists the method families it implements, so the
-client knows not to call, say, `completion/complete`. Requests other than `initialize`
-and `ping` before the handshake are refused.
-
-**Three primitives,** distinguished by who decides to use them:
-
-| Primitive | Controlled by | Methods | Here |
-| --- | --- | --- | --- |
-| Tools | the model | `tools/list`, `tools/call` | `list_tables`, `describe_table`, `run_query` |
-| Resources | the application | `resources/list`, `resources/templates/list`, `resources/read` | `sqlite://schema`, `sqlite://table/{table}` |
-| Prompts | the user | `prompts/list`, `prompts/get` | `ask_database` |
-
-Each tool advertises a JSON Schema for its arguments; the server validates arguments
-against it before calling the handler.
-
-**Two kinds of errors,** and choosing the right one matters:
-
-- *Protocol errors* (JSON-RPC `error`) mean the request itself was wrong: unknown method,
-  unknown tool, malformed params. The client handles these; the model usually never sees them.
-- *Tool errors* (a normal result with `"isError": true`) mean the tool ran and failed:
-  bad SQL, a refused write, a timeout. The model sees the message and can fix its query
-  and retry. Sending bad SQL back as a protocol error would hide the reason from the
-  model, which is the one party that can fix it.
-
-### Layer 4: the application ([`app.py`](src/sqlite_mcp/app.py), [`database.py`](src/sqlite_mcp/database.py))
+## The read-only safety model (`database.py`)
 
 The model writes the SQL, so every query is untrusted. Defence in depth:
 
 1. The file is opened with SQLite's `mode=ro` URI flag, and `PRAGMA query_only` is on.
-2. While a model-written query runs, an **authorizer callback** allows only `SELECT`,
-   column reads and function calls (minus `load_extension`). SQLite asks the authorizer
-   about every action in the *parsed* statement, so `INSERT`, `DROP`, `ATTACH`, `PRAGMA`
-   and `WITH x AS (...) DELETE ...` are all refused before they run. A regex like
-   "starts with SELECT" can't tell what a statement does; the parser can.
+2. While a model-written query runs, an **authorizer callback** allows only `SELECT`, column
+   reads and function calls (minus `load_extension`). SQLite asks the authorizer about every
+   action in the *parsed* statement, so `INSERT`, `DROP`, `ATTACH`, `PRAGMA` and
+   `WITH x AS (...) DELETE ...` are all refused before they run. A regex like "starts with
+   SELECT" can't tell what a statement does; the parser can.
 3. Python's `sqlite3` refuses to run more than one statement per call, so
    `SELECT 1; DROP TABLE books` fails outright.
-4. A progress handler aborts any query running past a deadline (5 s by default), so an
-   infinite recursive CTE can't hang the session.
-5. Results are capped (100 rows by default, 1000 max) with a `truncated` flag, so the model
-   knows to aggregate or filter instead of pulling the whole table into its context.
+4. A progress handler aborts any query running past a deadline (5 s by default).
+5. Results are capped (100 rows by default, 1000 max) with a `truncated` flag.
 
-`tests/test_database.py` throws each of those attacks at the server and checks that the
-database file's hash is unchanged afterwards.
+A refused query is raised as an exception, which the SDK returns to the model as a tool
+result with `isError: true` — so the model reads the message and can retry, instead of the
+client swallowing a protocol error.
+
+> **Python 3.10 note:** removing a SQLite authorizer with `set_authorizer(None)` needs
+> Python 3.11+. So the authorizer is installed once and gated by a flag that's only on
+> during model-written queries (`database.py`).
 
 ## Tests
 
 ```bash
-pytest                      # 58 tests, standard library only
-pip install -e ".[interop]" # optional: the official MCP SDK
-pytest                      # +1 test: the SDK's own client drives this server over stdio
+pytest
 ```
 
-- `test_jsonrpc.py`: framing and validation of raw messages.
-- `test_protocol.py`: the MCP layer, driven by raw JSON-RPC strings.
-- `test_database.py`: the read-only guarantees.
-- `test_stdio.py`: the real process, real pipes.
-- `test_sdk_interop.py`: an independent implementation (the official Python SDK client)
-  completes a full session against this server. Hand-rolled protocol code is easy to get
-  subtly wrong; this is the check that it isn't.
+- `test_database.py`: the read-only guarantees, called directly. Each attack
+  (`DELETE`, `DROP`, `ATTACH`, stacked statements, a runaway recursive CTE) is thrown at the
+  server and the database file's hash is checked unchanged afterward.
+- `test_server.py`: the SDK's own client drives the real `python -m sqlite_mcp` process over
+  stdio through a full session — initialize, `tools/list`, every tool, resources and the
+  prompt — and confirms writes come back as `isError: true` and leave the file unchanged.
 
 ## What this deliberately leaves out
 
-Being clear about the gaps is part of understanding the protocol:
-
-- **Newer protocol versions.** The server speaks 2025-06-18 (and accepts 2025-03-26 and
-  2024-11-05). Newer clients ask for a later version and accept the downgrade, which is
-  how version negotiation is meant to work.
-- **Streamable HTTP transport**, needed for remote servers and authentication.
-- **Concurrency and cancellation.** Requests are handled one at a time, so
-  `notifications/cancelled` is acknowledged but has nothing to cancel.
-- **Pagination** of list results, `listChanged` notifications, resource subscriptions,
-  logging, completions, and server-to-client requests such as sampling and elicitation.
+- **Access control below the table level.** Anyone who can query can read any row.
+- **Streamable HTTP transport** and authentication (the SDK supports it; this server runs
+  over stdio only).
+- **Concurrency.** Requests are handled one at a time.
 
 ## Project layout
 
 ```
 src/sqlite_mcp/
-  jsonrpc.py      Layer 1: JSON-RPC 2.0
-  transport.py    Layer 2: stdio
-  protocol.py     Layer 3: MCP lifecycle and primitives (generic, no SQLite)
-  app.py          Layer 4: SQLite tools/resources/prompts, CLI entry point
-  database.py     sandboxed read-only queries
+  server.py       the MCP server (FastMCP): tools, resources, prompt, CLI entry point
+  database.py     read-only, sandboxed SQLite queries
   sample_data.py  builds bookstore.db
-scripts/raw_client.py   dependency-free client that prints the wire traffic
+scripts/raw_client.py   a dependency-free client that prints the wire traffic
 tests/
 ```
 

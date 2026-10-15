@@ -5,7 +5,7 @@ import hashlib
 import pytest
 
 from sqlite_mcp.database import Database
-from sqlite_mcp.protocol import ToolError
+from sqlite_mcp.database import ToolError
 
 
 @pytest.mark.parametrize(

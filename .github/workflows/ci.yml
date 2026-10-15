@@ -24,9 +24,5 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -e ".[dev]"
-      - name: Tests (standard library only)
+      - name: Tests
         run: pytest -q
-      - name: Interop with the official MCP SDK client
-        run: |
-          pip install -e ".[interop]"
-          pytest -q tests/test_sdk_interop.py
