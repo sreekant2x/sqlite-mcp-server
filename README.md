@@ -21,6 +21,54 @@ dependencies, so every layer between the model and the database is visible and t
       bookstore.db
 ```
 
+## About this project
+
+I built this to understand what actually happens underneath an AI tool, instead of
+treating the protocol as a black box. Model Context Protocol is the standard that lets an
+AI model talk to outside tools and data: a server exposes capabilities, and any MCP client
+can use them. There's an official SDK that hides the protocol, but I wanted to see every
+layer, so I wrote the whole stack by hand in plain Python with no dependencies.
+
+**What it is.** A server that gives an AI agent read-only access to a local SQLite
+database. The agent asks a question in plain language; it reads the database's structure,
+writes the SQL itself, and my server runs that SQL safely and returns the rows. One thing I
+want to be clear about: the server does not do the natural-language part. The model writes
+the SQL. My job was to expose the database well and to make running untrusted SQL safe.
+
+**The pathway — how a request flows through it.** An MCP client (a desktop AI app, an IDE,
+or the MCP Inspector) launches my server as a child process and talks to it over stdin and
+stdout. A request travels down four layers, each one only knowing about the one below it:
+
+1. `jsonrpc.py` — every message is a JSON-RPC 2.0 object (a request, a notification, or a
+   response). This layer just parses the text and builds replies.
+2. `transport.py` — moves one JSON message per line over the pipes. Its one hard rule is
+   that stdout is only for protocol messages; all logging goes to stderr, or the stream gets
+   corrupted and the client disconnects.
+3. `protocol.py` — the MCP lifecycle: the `initialize` handshake where the client and
+   server agree on a protocol version and exchange capabilities, then the three things a
+   server can expose — tools, resources, and prompts.
+4. `app.py` + `database.py` — the actual SQLite tools, and the read-only query engine.
+
+**How it works, step by step.** The client sends `initialize`; I answer with the protocol
+version I support and my capabilities. The model then calls `list_tables`, calls
+`describe_table` on the tables it cares about, writes a `SELECT`, and calls `run_query`. I
+run that query in a sandbox, cap the number of rows, and send them back. If the SQL is
+invalid or tries to write, I return an error the model can read and retry on.
+
+**Two design choices I'd call out.** First, the read-only guarantee isn't a check that the
+query "starts with SELECT" — a string check can't see what a statement really does. It uses
+SQLite's authorizer, which inspects the parsed statement and blocks anything that isn't a
+read before it runs, so `DROP`, `ATTACH`, `PRAGMA`, and even a `DELETE` hidden inside a
+`WITH` are all refused. Second, bad SQL comes back as a normal tool result marked
+`isError: true`, not as a JSON-RPC protocol error. That's deliberate: the model is the one
+that can fix the query, so it needs to see the failure and try again, rather than have the
+client swallow it.
+
+**How someone uses it.** Point it at any SQLite file and connect it to an MCP client (see
+Quick start below), or run `scripts/raw_client.py` to watch a whole session on the wire
+without any client at all. There's a sample bookstore database included so it works out of
+the box.
+
 ## Where the "natural language" actually happens
 
 Not here. The server never sees an English question it has to interpret. The client's
